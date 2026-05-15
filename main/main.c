@@ -4,7 +4,10 @@
 //.........................................................................................................//
 
 
+// ============================================= //
 // ================= LIBRERÍAS ================= //
+// ============================================= //
+
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -18,7 +21,10 @@
 #include "esp_adc/adc_oneshot.h"
 
 
+// ================================================= //
 // ================= CONFIGURACIÓN ================= //
+// ================================================= //
+
 #define TX_GPIO     GPIO_NUM_4
 #define RX_GPIO     GPIO_NUM_5
 #define BITRATE     1000000
@@ -27,17 +33,26 @@
 #define PULSADOR    GPIO_NUM_16
 
 
+// =========================================== //
 // ================= TAG LOG ================= //
+// =========================================== //
+
 static const char *TAG = "CAN";
 
 
+// ======================================= //
 // ========== PARAMETROS TAREAS ========== //
+// ======================================= //
+
 static uint32_t usStackDepth = 2048;
 TaskHandle_t pvCreatedTask = NULL;
 TaskHandle_t pvParameters = NULL;
 
 
-// ================= GLOBAL VARIABLES ================= //
+// ==================================================== //
+// ================= HANDLES Y COLAS ================== //
+// ==================================================== //
+
 static adc_oneshot_unit_handle_t adc_handle;
 static twai_node_handle_t node_hdl = NULL;
 static SemaphoreHandle_t can_mutex;
@@ -45,7 +60,10 @@ static SemaphoreHandle_t btn_sem;
 static QueueHandle_t rx_queue;
 
 
+// ================================ //
 // ======== ISR PULSADOR ========== //
+// ================================ //
+
 // Cuando se detecta una interrupción por el botón, se libera el semáforo btn_sem para que la tarea btn_task pueda procesar la acción del botón.
 static void IRAM_ATTR gpio_isr_handler(void* arg)
 {
@@ -53,7 +71,9 @@ static void IRAM_ATTR gpio_isr_handler(void* arg)
 }
 
 
+// ================================================= //
 // ================= CALLBACKS CAN ================= //
+// ================================================= //
 
 // Callback de transmisión: Se llama cuando se completa una transmisión.
 static IRAM_ATTR bool twai_tx_cb(twai_node_handle_t handle,const twai_tx_done_event_data_t *edata,void *user_ctx)
@@ -71,31 +91,76 @@ static IRAM_ATTR bool twai_tx_cb(twai_node_handle_t handle,const twai_tx_done_ev
     return false;
 }
 
+
 // Callback de error: Se llama cuando ocurre un error en el bus CAN. Se registra el error en el log para su diagnóstico.
 static IRAM_ATTR bool twai_error_cb(twai_node_handle_t handle,const twai_error_event_data_t *edata,void *user_ctx)
 {
-    ESP_EARLY_LOGW(TAG, "Error TWAI: 0x%x", edata->err_flags.val);
-    return false;
-}
-
-// Callback de recepción: Se llama cuando se recibe un mensaje CAN.
-static bool twai_rx_cb(twai_node_handle_t handle, const twai_rx_done_event_data_t *edata, void *user_ctx)
-{
-    uint8_t recv_buff[8];
-    twai_frame_t rx_frame = {
-        .buffer = recv_buff,
-        .buffer_len = sizeof(recv_buff),
-    };
-    if (ESP_OK == twai_node_receive_from_isr(handle, &rx_frame)) {
-        xQueueSendFromISR(rx_queue, &rx_frame, NULL);
-        ESP_LOGE(TAG, "Recibido respuesta");
+    if (edata->err_flags.val == 0x10) {
+        ESP_EARLY_LOGW(TAG, "El receptor se ha desconectado o no está respondiendo.");
+    }
+    else if (edata->err_flags.val == 0x02) {
+        ESP_EARLY_LOGW(TAG, "El transmisor se ha desconectado o no está respondiendo.");
+    }
+    else {
+        ESP_EARLY_LOGW(TAG, "Error TWAI: 0x%x", edata->err_flags.val);
     }
     return false;
 }
 
 
+// Callback de recepción: Se llama cuando se recibe un mensaje CAN.
+static bool twai_rx_cb(twai_node_handle_t handle,const twai_rx_done_event_data_t *edata,void *user_ctx)
+{
+    // Buffer para almacenar los datos recibidos, junto con variables para el ID y DLC del mensaje.
+    // Se utiliza un buffer de 8 bytes, que es el tamaño máximo de datos en un mensaje CAN.
+    uint8_t recv_buff[8];
+    uint32_t id;
+    uint8_t dlc;
 
-// =========== TAREA PARA ENVIAR POTENCIOMETRO ===========
+    // Estructura para almacenar el mensaje recibido, incluyendo el buffer de datos y su longitud.
+    twai_frame_t rx_frame = {
+        .buffer = recv_buff,
+        .buffer_len = sizeof(recv_buff),
+    };
+
+    // Si se recibe un mensaje correctamente
+    if (ESP_OK == twai_node_receive_from_isr(handle, &rx_frame)) {
+        // Obtener DLC del mensaje recibido
+        uint8_t dlc = rx_frame.header.dlc;
+
+        // Asegurarse de que el DLC no exceda el tamaño máximo permitido (8 bytes)
+        if (dlc > 8)
+        {
+            dlc = 8;
+        }
+        
+        // buffer temporal para almacenar los datos recibidos, que se copiarán al mensaje que se enviará a la cola
+        uint8_t msg[8];
+
+        // Bucle para copiar los datos recibidos al buffer temporal, que se utilizará para enviar a la cola
+        for (int i = 0; i < dlc; i++) {
+            msg[i] = recv_buff[i];
+        }
+
+        // Bucle para rellenar el resto del mensaje con ceros
+        for (int i = dlc; i < 8; i++) {
+            msg[i] = 0;
+        }
+
+        // Si se envía el mensaje a la cola y produce error, se registra un mensaje de error.
+        if (xQueueSendFromISR(rx_queue, msg, NULL) != pdTRUE) {
+            ESP_EARLY_LOGW(TAG, "Error al enviar a la cola");
+        }
+    }
+
+    return false;
+}
+
+
+// ======================================================= //
+// =========== TAREA PARA ENVIAR POTENCIOMETRO =========== //
+// ======================================================= //
+
 // Esta tarea lee el valor del potenciómetro, calcula la media de 10 lecturas y envía el resultado a través del bus CAN cada 100 ms.
 // Para evitar conflictos en el acceso al bus CAN, se utiliza un mutex (can_mutex) para asegurar que solo una tarea pueda transmitir en un momento dado.
 void read_pot(void *pvParameters) {
@@ -138,7 +203,10 @@ void read_pot(void *pvParameters) {
 }
 
 
-// =========== TAREA PARA EL BOTÓN (POR INTERRUPCIÓN) ===========
+// ============================================================== //
+// =========== TAREA PARA EL BOTÓN (POR INTERRUPCIÓN) =========== //
+// ============================================================== //
+
 // Esta tarea se activa cuando se presiona el botón. Al detectar la interrupción, se libera el semáforo btn_sem, lo que permite que esta tarea procese
 // la acción del botón.
 void btn_task(void *pvParameters) {
@@ -170,28 +238,39 @@ void btn_task(void *pvParameters) {
 }
 
 
+// ==================================================== //
 // ======== TAREA PARA MOSTRAR ESTADO RECIBIDO ======== //
-// Esta tarea se encarga de recibir los mensajes del bus CAN a través de la cola rx_queue y mostrar su contenido. Cada vez que se recibe un mensaje,
-// se imprime su ID, DLC y los datos en formato hexadecimal.
-void can_receive_task(void *pvParameters) {
-    twai_frame_t rx_frame;
+// ==================================================== //
 
+// Esta tarea se encarga de recibir los mensajes del bus CAN a través de la cola rx_queue.
+// Cuando se recibe un mensaje, se procesa y se muestra su contenido en el log.
+void can_receive_task(void *pvParameters)
+{
+    // Buffer para almacenar el mensaje recibido de la cola
+    uint8_t msg[8];
+    // Bucle infinito para esperar a que se reciban mensajes en la cola rx_queue.
     while (1) {
-        if (xQueueReceive(rx_queue, &rx_frame, portMAX_DELAY)) {
+        // Si se recibe mensaje de la cola
+        if (xQueueReceive(rx_queue, msg, portMAX_DELAY)) {
 
-            printf("ID: 0x%lX DLC: %d Data: ", rx_frame.header.id, rx_frame.header.dlc);
+            // Array para almacenar el mensaje recibido
+            int leds[8];
 
-            for (int i = 0; i < rx_frame.header.dlc; i++) {
-                ESP_LOGI(TAG, "%02X ", rx_frame.buffer[i]);
+            // Bucle para copiar los datos del mensaje recibido
+            for (int i = 0; i < 8; i++) {
+                leds[i] = msg[i];
             }
 
-            printf("\n");
+            ESP_LOGI(TAG, "Mensaje Recibido: %d", leds[0]);
         }
     }
 }
 
 
+// =================================================== //
 // ============== CONFIGURAR PERIFÉRICOS ============= //
+// =================================================== //
+
 // Esta función configura los periféricos necesarios para el proyecto, incluyendo el botón (PULSADOR) y el ADC para el potenciómetro (POT).
 static void configure_peripherals(void)
 {
@@ -214,17 +293,13 @@ static void configure_peripherals(void)
     };
     // Crear el controlador ADC para el potenciómetro (POT)
     ESP_ERROR_CHECK(adc_oneshot_new_unit(&init_config1, &adc_handle));
-    // Configuración del canal ADC para el potenciómetro (POT)
-    adc_oneshot_chan_cfg_t config1 = {
-        .atten = ADC_ATTEN_DB_11,
-        .bitwidth = ADC_BITWIDTH_DEFAULT,
-    };
-    // Configurar el canal ADC para el potenciómetro (POT)
-    ESP_ERROR_CHECK(adc_oneshot_config_channel(adc_handle, POT, &config1));
 
 }
 
+// =========================================== //
 // ============== CONFIGURAR CAN ============= //
+// =========================================== //
+
 // Esta función configura el bus CAN utilizando el controlador TWAI on-chip. Se establece la configuración de los pines de transmisión y recepción,
 // la velocidad de transmisión, y se registran los callbacks para eventos de transmisión, recepción y errores. Finalmente, se habilita el nodo CAN
 // para comenzar a operar.
@@ -252,8 +327,10 @@ static void init_can(void)
     ESP_ERROR_CHECK(twai_node_enable(node_hdl));
 }
 
-
+// ===================================================== //
 // ================= FUNCIÓN PRINCIPAL ================= //
+// ===================================================== //
+
 // En la función principal se crean los semáforos y la cola necesarios para la comunicación entre tareas, se configuran los periféricos y el bus CAN
 // y se crean las tareas para leer el potenciómetro, procesar el botón y recibir mensajes del bus CAN.
 void app_main(void)
